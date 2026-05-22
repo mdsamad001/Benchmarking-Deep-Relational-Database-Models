@@ -14,7 +14,7 @@ bash setup.sh
 ```
 
 This script:
-1. Detects your conda installation
+1. Detects conda installation
 2. Creates a conda environment named `dbformer` (Python 3.13)
 3. Installs numpy, pandas, scipy, scikit-learn via conda (aarch64 pre-built binaries)
 4. Installs PyTorch 2.12.0 from the CUDA 13.0 wheel index
