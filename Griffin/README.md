@@ -35,40 +35,38 @@ running on an **NVIDIA DGX Spark GB10** (ARM Grace + Blackwell).
 Griffin/
 │
 │── Core training
-│   ├── hmaintask_combine.py          Main training entry point (multi-seed, all tasks)
-│   ├── hmaintask_downsample_absolute_eval_sample.py
-│   │                                 Alt trainer — adds downsampling for large datasets
-│   ├── hmaintask_completion.py       Self-supervised pretraining (feature-completion)
-│   └── run_one_db.py                 Convenience wrapper: filter + launch single DB
+│   ├── hmaintask_combine.py         
+│   ├── hmaintask_completion.py      
+│   └── run_one_db.py                
 │
 │── Model and data
-│   ├── hmodel.py                     GriffinMod: relational MPNN + cross-attention
-│   ├── hdataset.py                   Graph class: loads HF datasets, multi-hop subgraph
-│   ├── hloaderwrapper.py             Batch construction, fanout sampling, DataLoader wraps
-│   ├── hFloatEmb.py                  Float encoder (floatenc-512.pt) and decoder
-│   ├── metric.py                     Evaluation metrics (MSE, RMSE, MAE, AUC, HR@1)
-│   ├── floatenc-512.pt               Pre-trained float feature encoder (hiddim=512)
-│   └── floatdec-512.pt               Pre-trained float feature decoder (hiddim=512)
+│   ├── hmodel.py                     
+│   ├── hdataset.py                  
+│   ├── hloaderwrapper.py             
+│   ├── hFloatEmb.py                 
+│   ├── metric.py                    
+│   ├── floatenc-512.pt              
+│   └── floatdec-512.pt              
 │
-│── Data pipeline  (only needed to rebuild a dataset from scratch)
-│   ├── dataconverter.py              Node features → HuggingFace datasets
-│   ├── dataconverteredge.py          Adjacency lists → HF datasets
-│   ├── dataconvertertask.py          Task labels + splits → HF datasets
-│   ├── dataconverterpost.py          Post-processing (edge name embeddings)
-│   ├── combine_dataset.py            Merge two Griffin-format datasets
-│   ├── make_textemb.py               Text → sentence embedding
-│   ├── make_textemb_from_ids.py      Variant that takes pre-computed IDs
-│   └── build_relbench_rel_amazon_griffin.sh   End-to-end data build example
+│── Data pipeline 
+│   ├── dataconverter.py              
+│   ├── dataconverteredge.py          
+│   ├── dataconvertertask.py          
+│   ├── dataconverterpost.py         
+│   ├── combine_dataset.py            
+│   ├── make_textemb.py              
+│   ├── make_textemb_from_ids.py      
+│   └── build_relbench_rel_amazon_griffin.sh   
 │
 │── Setup and runners
-│   ├── setup_dgx_spark.sh            One-time environment setup (DGX Spark)
-│   ├── run_task.sh                   Run a single training job
-│   ├── run_hop_sweep.sh              Run hop=0/1/2 comparison sweep
-│   ├── hconfig_dgx_spark.yaml        Accelerate config — single GPU
-│   ├── hconfig_8gpu.yaml             Accelerate config — 8-GPU multi-process
-│   └── requirements_dgx_spark.txt    Pip requirements (torch installed separately)
+│   ├── setup_dgx_spark.sh            
+│   ├── run_task.sh                  
+│   ├── run_hop_sweep.sh              
+│   ├── hconfig_dgx_spark.yaml        
+│   ├── hconfig_8gpu.yaml             
+│   └── requirements_dgx_spark.txt    
 │
-└── task_names.yaml                   Grouped list of all benchmark tasks
+└── task_names.yaml                   
 ```
 
 ---
@@ -78,8 +76,8 @@ Griffin/
 ### Step 1 — Clone and enter the repository
 
 ```bash
-git clone <your-repo-url> Griffin
-cd Griffin
+git clone https://github.com/mdsamad001/Benchmarking-Deep-Relational-Database-Models.git
+cd Benchmarking-Deep-Relational-Database-Models/Griffin
 ```
 
 ### Step 2 — One-time environment setup
@@ -146,23 +144,6 @@ datasets/filtered/<db_name>/
 └── task/
     └── <task_name>/       one HF dataset per task
 ```
-
-### Building a new dataset from a RelBench database
-
-Use `build_relbench_rel_amazon_griffin.sh` as a template.  The pipeline has
-six stages — see the script for the exact commands:
-
-```
-Stage 1: git checkout processing_data branch
-Stage 2: pip install relbench tab2graph
-Stage 3: convert_relbench_to_dbinfer.py  →  RDB format
-Stage 4a: tab2graph preprocess (raw)
-Stage 4b: tab2graph preprocess (Griffin features)
-Stage 4c: tab2graph construct-graph
-Stage 5: git checkout main-public
-Stage 6: dataconverter.py / dataconverteredge.py / dataconvertertask.py
-```
-
 > Data pipeline dependencies (`pqdm`, `pandas`, `sentence-transformers`, `tqdm`)
 > are commented out in `requirements_dgx_spark.txt` and only needed for this
 > stage. Uncomment them if rebuilding a dataset.
@@ -180,19 +161,15 @@ Stage 6: dataconverter.py / dataconverteredge.py / dataconvertertask.py
 **Examples:**
 
 ```bash
-# F1 driver position — hop=2, fanout 10 at hop-1 and 30 at hop-2
+# F1 driver position — hop=2
 ./run_task.sh datasets/filtered/rel-f1_only rel-f1-driver-position \
-    --hop 2 --fanout 10 30
-
-# Amazon item-churn — hop=2, uniform fanout 10 at each hop
-./run_task.sh datasets/filtered/rel-amazon_only rel-amazon-item-churn \
-    --hop 2 --fanout 10 10 --maxepoch 100
+    --hop 2 
 
 # StackExchange — multiple seeds
 ./run_task.sh datasets/filtered/stackexchange stackexchange-churn \
-    --hop 2 --fanout 10 10 --seed 0 1 2
+    --hop 2 --seed 0 1 2
 
-# Zero-hop baseline (no graph neighbors, feature-only)
+# Zero-hop
 ./run_task.sh datasets/filtered/rel-f1_only rel-f1-driver-position \
     --hop 0
 ```
@@ -222,36 +199,6 @@ accelerate launch \
 
 ---
 
-## Training Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `dataset` | *(required)* | Path to Griffin-format dataset directory |
-| `logdir` | *(required)* | Directory for loss CSVs and plots |
-| `logname` | *(required)* | Run name prefix for output files |
-| `--tasks` | `ALLTASK` | Space-separated task names to train on. Use `ALLTASK` to train on all tasks in the dataset simultaneously |
-| `--hop` | `2` | Number of graph hops for subgraph extraction |
-| `--fanout` | `[10] * hop` | Per-hop neighbor fanout. Pass one value per hop, e.g. `--fanout 10 30` for hop=2 |
-| `--fewshotfanout` | `0` | Additional few-shot neighbors sampled for the target node |
-| `--hiddim` | `256` | Hidden dimension. **Must be `512`** to use the shipped `floatenc-512.pt` |
-| `--num_mp` | `4` | Number of relational message-passing layers |
-| `--use_rev` | `True` | Add reverse (destination→source) message-passing edges |
-| `--use_gate` | `True` | Gated combination of forward/reverse messages |
-| `--batchsize` | `512` | Training batch size |
-| `--eval_batchsize` | same as batchsize | Batch size used during evaluation |
-| `--lr` | `3e-4` | AdamW learning rate |
-| `--wd` | `4e-4` | AdamW weight decay |
-| `--maxepoch` | `10` | Number of training epochs |
-| `--eval_per_epoch` | `3` | Log per-task validation metrics every N epochs |
-| `--seed` | `[0]` | One or more random seeds: `--seed 0 1 2` runs three independent trials |
-| `--savepath` | `None` | Directory to save best-checkpoint per seed |
-| `--loadpath` | `None` | Path to an existing checkpoint to warm-start from |
-
-> **`--hiddim 512` is required** when using the pre-trained encoders shipped
-> with this repo.  `run_task.sh` always passes `--hiddim 512`.
-
----
-
 ## Outputs
 
 Training produces the following files:
@@ -278,7 +225,7 @@ results/<db>/<task>/<hop>/
 ```json
 {
   "task": "rel-f1-driver-position",
-  "config": { "hop": 2, "fanout": [10, 30], "hiddim": 512, ... },
+  "config": { "hop": 2, ... },
   "best_val_metric": 0.387,
   "best_val_epoch": 14,
   "test_metric": 0.412,
@@ -289,118 +236,3 @@ results/<db>/<task>/<hop>/
 ```
 
 ---
-
-## Metrics
-
-Each task has one metric defined in `metatask.yaml`.
-
-| Metric name | Type | Better |
-|-------------|------|--------|
-| `mse` | Mean squared error | Lower |
-| `rmse` | Root mean squared error | Lower |
-| `mae` | Mean absolute error | Lower |
-| `auc` / `retrieval_auroc` | Multi-class AUROC | Higher |
-| `hr@1` | Hit-rate at rank 1 | Higher |
-| `retrieval_logloss` | Cross-entropy | Lower |
-
-All metrics are reported as raw positive values in their natural units.
-The training script uses `metric_higher_is_better()` internally to select the
-best checkpoint in the correct direction.
-
----
-
-## Available Tasks
-
-Tasks are grouped in `task_names.yaml`:
-
-**commerce-1:** `diginetica-downsample-ctr`, `rel-hm-item-sales`, `rel-hm-user-churn`, `retailrocket-cvr`, `seznam-charge`, `seznam-prepay`
-
-**commerce-2:** `amazon-churn`, `amazon-rating`, `outbrain-small-ctr`, `rel-avito-ad-ctr`, `rel-avito-user-clicks`, `rel-avito-user-visits`
-
-**others-1:** `rel-f1-driver-dnf`, `rel-f1-driver-position`, `rel-f1-driver-top3`, `stackexchange-churn`, `stackexchange-upvote`, `virus-wnv-pred`
-
-**others-2:** `airbnb-destination`, `rel-trial-site-success`, `rel-trial-study-adverse`, `rel-trial-study-outcome`, `talkingdata-demo-pred`, `telstra-severity`
-
-**single-table:** 50+ tabular regression benchmarks (anime ratings, car prices, wine scores, etc.) — see `task_names.yaml` for the full list.
-
----
-
-## Self-Supervised Pretraining
-
-`hmaintask_completion.py` implements a feature-completion pretraining objective:
-one feature column is masked per sample and predicted from the node's graph
-neighborhood.  Run it before fine-tuning to warm-start the encoder:
-
-```bash
-accelerate launch \
-    --config_file hconfig_dgx_spark.yaml \
-    hmaintask_completion.py \
-    <DATASET_DIR> \
-    <LOG_DIR> \
-    <RUN_NAME> \
-    --hop 2 --fanout 10 10 --hiddim 512
-```
-
-Then pass the resulting checkpoint to the main training script via
-`--loadpath <checkpoint_dir>`.
-
----
-
-## Known Platform Notes
-
-### `torch_geometric` removed
-
-PyG's C++ extensions (`torch-scatter`, `torch-sparse`, `torch-cluster`,
-`torch-spline-conv`) have no pre-built `aarch64` wheels and fail to compile on
-DGX Spark.  Griffin only used `MeanAggregation` and `MaxAggregation` from PyG.
-These are reimplemented in `hmodel.py` using native `torch.scatter_add_` and
-`torch.scatter_reduce_` — available in all PyTorch ≥ 2.0 releases.
-
-### `torch.unique` on 2D tensors crashes on Blackwell (sm_121)
-
-Calling `torch.unique` on a 2D tensor routes through a merge-sort CUDA kernel
-that produces `cudaErrorIllegalAddress` on Blackwell with PyTorch 2.12 + CUDA
-13.  The `RMPNN.forward` method in `hmodel.py` encodes `(src_node, edge_type)`
-as a single `int64` key so that `torch.unique` operates only on a 1D tensor,
-avoiding the broken kernel path entirely.
-
-### Tensorboard is optional
-
-If `tensorboard` is not installed, the training script logs to CSV/PNG only
-and suppresses the accelerate `UserWarning` automatically.  To enable
-TensorBoard logging: `pip install tensorboard` then re-run training.
-
----
-
-## Troubleshooting
-
-**`cudaErrorIllegalAddress` in RMPNN.forward**
-Your `hmodel.py` is older than the fix.  Replace it with the patched version
-that uses the 1D-key approach for `torch.unique`.
-
-**Metrics are negative (e.g. `-0.44` for MSE)**
-Your `metric.py` is the pre-fix version that negated regression scores.
-Replace `metric.py` and `hmaintask_combine.py` with the patched versions.
-
-**`AttributeError: 'CudaDeviceProperties' object has no attribute 'total_mem'`**
-Replace `total_mem` with `total_memory` in `setup_dgx_spark.sh` line 102.
-
-**`ImportError: cannot import name 'METRIC_LOWER_IS_BETTER' from 'metric'`**
-Replace `hmaintask_combine.py` with the patched version — the import was
-updated to `from metric import compute_metric, metric_higher_is_better`.
-
-**`torch-scatter` / `torch-sparse` build failure**
-These are not needed.  `torch_geometric` has been removed from this codebase.
-Do not install PyG packages — run `pip uninstall torch-scatter torch-sparse
-torch-cluster torch-spline-conv torch-geometric` if they were installed.
-
-**`UserWarning: log_with=tensorboard was passed but no supported trackers installed`**
-Install tensorboard (`pip install tensorboard`) or ignore it — training proceeds
-correctly without it.
-
----
-
-## File-by-File Change Log
-
-See `CHANGES.md` for a precise description of every bug that was fixed,
-which line was changed, and why.
