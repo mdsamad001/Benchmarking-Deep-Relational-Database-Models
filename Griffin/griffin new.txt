@@ -1,0 +1,1649 @@
+hdataset.py -
+
+import os
+import os.path as osp
+import glob
+import warnings
+from typing import Optional, Iterable, Union, Literal, Any
+
+import yaml
+import torch
+import datasets as hds
+from datasets import load_dataset
+import numpy as np
+
+INF = 100000000
+MAXINT64 = 1 << 62
+TIMESTAMPADJNAME = "___TIMESTAMP"
+
+
+# -------------------------
+# Robust HF dataset loaders
+# -------------------------
+def _list_arrow_files(folder: str) -> list[str]:
+    return sorted(glob.glob(osp.join(folder, "data-*-of-*.arrow")))
+
+
+def load_arrow_folder(folder: str) -> hds.Dataset:
+    """
+    Load a folder containing HF arrow shards named data-xxxxx-of-xxxxx.arrow.
+    """
+    files = _list_arrow_files(folder)
+    if len(files) == 0:
+        raise FileNotFoundError(f"No arrow shards found in {folder}")
+    return load_dataset("arrow", data_files=files, split="train")
+
+
+def load_hf_folder(folder: str) -> hds.Dataset:
+    """
+    Robustly load a dataset folder that may be:
+      1) datasets.save_to_disk() format (folder has dataset_info.json + state.json)
+      2) a folder of raw arrow shards (data-*.arrow)
+      3) a folder containing shard_XXX/ subfolders (each shard may be save_to_disk or arrow shards)
+
+    Returns a HuggingFace Dataset.
+    """
+    info = osp.join(folder, "dataset_info.json")
+    state = osp.join(folder, "state.json")
+    if osp.exists(info) and osp.exists(state):
+        return hds.load_from_disk(folder)
+
+    # shard directories?
+    shard_dirs = sorted(
+        [p for p in glob.glob(osp.join(folder, "shard_*")) if osp.isdir(p)]
+    )
+    if len(shard_dirs) > 0:
+        # Try concatenate shards
+        datasets = []
+        for sd in shard_dirs:
+            sd_info = osp.join(sd, "dataset_info.json")
+            sd_state = osp.join(sd, "state.json")
+            if osp.exists(sd_info) and osp.exists(sd_state):
+                ds = hds.load_from_disk(sd)
+            else:
+                # raw arrow in shard folder
+                ds = load_arrow_folder(sd)
+            datasets.append(ds)
+
+        if len(datasets) == 1:
+            return datasets[0]
+        return hds.concatenate_datasets(datasets)
+
+    # fallback: raw arrow shards in folder itself
+    return load_arrow_folder(folder)
+
+
+# -------------------------
+# Index normalization
+# -------------------------
+def _to_hf_index(idx: Any):
+    """
+    Normalize indices so HF Dataset __getitem__ works reliably in DataLoader workers.
+
+    Supports:
+      - int
+      - list[int]
+      - range
+      - np.ndarray
+      - torch.Tensor (0-d, 1-d)
+    """
+    if isinstance(idx, range):
+        return list(idx)
+
+    if isinstance(idx, int):
+        return idx
+
+    if isinstance(idx, (list, tuple)):
+        return list(idx)
+
+    if isinstance(idx, np.ndarray):
+        if idx.ndim == 0:
+            return int(idx.item())
+        return idx.astype(np.int64).tolist()
+
+    if torch.is_tensor(idx):
+        if idx.ndim == 0:
+            return int(idx.item())
+        return idx.detach().cpu().to(torch.long).tolist()
+
+    raise TypeError(f"Unsupported idx type: {type(idx)}")
+
+
+# -------------------------
+# Graph components
+# -------------------------
+class Node:
+    meta: dict
+    feat: hds.Dataset
+    textemb: Union[hds.Dataset, None]
+    adj: Union[hds.Dataset, None]
+
+    def __init__(self, meta, feat, textemb, adj) -> None:
+        self.meta = meta
+        self.feat = feat
+        self.textemb = textemb
+        self.adj = adj
+
+        # Keep asserts, but make the error message informative.
+        assert len(self.feat) == int(self.meta["num"]), (
+            f"[Node:{self.meta.get('name','?')}] feat has {len(self.feat)} while meta says {self.meta['num']} nodes "
+            f"(feat path maybe not loaded correctly?)"
+        )
+        if self.adj is not None:
+            assert len(self.adj) == int(self.meta["num"]), (
+                f"[Node:{self.meta.get('name','?')}] adj has {len(self.adj)} while meta says {self.meta['num']} nodes"
+            )
+
+    def __len__(self):
+        return int(self.meta["num"])
+
+    @property
+    def is_target(self):
+        return bool(self.meta["is_target"])
+
+    @property
+    def featlist(self):
+        return self.meta["feat"]
+
+    def getfeat(self, idx: Union[int, Iterable[int], range, torch.Tensor, np.ndarray], floatemb) -> torch.Tensor:
+        idx_hf = _to_hf_index(idx)
+        data: dict = self.feat[idx_hf]
+
+        # Only require textemb if node actually has Griffin_text_ features
+        needs_text = any(("Griffin_text_" in col) for col in self.featlist)
+        if needs_text and self.textemb is None:
+            raise RuntimeError(
+                "Node has Griffin_text_ features but textemb is missing. "
+                "Check datasets/.../node/<nodetype>/textemb"
+            )
+
+        def unique_query_textemb(text_idx: torch.Tensor):
+            unique_idx, inv = torch.unique(text_idx, return_inverse=True)
+            return self.textemb[_to_hf_index(unique_idx)]["emb"][inv]
+
+        def unique_float_emb(val: torch.Tensor):
+            unique_val, inv = torch.unique(val, return_inverse=True)
+            return floatemb(unique_val)[inv]
+
+        out = torch.stack(
+            [
+                unique_query_textemb(data[col]) if "Griffin_text_" in col else unique_float_emb(data[col])
+                for col in self.featlist
+            ],
+            dim=1,
+        )  # (B, num_col, dim)
+        return out
+
+    def getedge(self, idx: torch.LongTensor, fanout: int = INF, timestamp: list[int] = None):
+        if self.adj is None or self.is_target:
+            return {}
+
+        num_q = len(idx)
+        subadj: dict = self.adj[_to_hf_index(idx)]
+        subadj.pop("number", None)
+
+        hastimestamp = timestamp is not None
+        if hastimestamp:
+            assert len(timestamp) == num_q
+
+        ret = {}
+        for key in list(subadj.keys()):
+            if key.endswith(TIMESTAMPADJNAME):
+                continue
+
+            adj = subadj[key]
+            if len(adj) == 0:
+                continue
+
+            if not isinstance(adj, torch.Tensor):
+                # list-of-tensors => pad
+                assert isinstance(adj, list)
+                adj = torch.nn.utils.rnn.pad_sequence(adj, batch_first=True, padding_value=-1)
+
+            if len(adj.flatten()) == 0:
+                continue
+
+            assert adj.ndim == 2, f"{adj.shape}"
+            assert adj.shape[0] == num_q
+
+            rootnode = torch.arange(num_q).reshape(-1, 1).repeat(1, adj.shape[1])
+
+            if hastimestamp:
+                ts_key = key + TIMESTAMPADJNAME
+                if ts_key in subadj:
+                    adjtimestamp = subadj[ts_key]
+                    if not isinstance(adjtimestamp, torch.Tensor):
+                        adjtimestamp = torch.nn.utils.rnn.pad_sequence(adjtimestamp, batch_first=True, padding_value=-1)
+                    assert adjtimestamp.ndim == 2
+                    assert adjtimestamp.shape[0] == num_q
+                    adj = adj.clone()
+                    ts = timestamp
+                    if ts is None:
+                        pass
+                    else:
+                        if isinstance(ts, torch.Tensor):
+                            ts_t = ts.to(device=adjtimestamp.device)
+                        else:
+                            # list / numpy -> torch
+                            ts_t = torch.as_tensor(ts, device=adjtimestamp.device)
+                    
+                        # ensure shape [B, 1]
+                        if ts_t.ndim == 1:
+                            ts_t = ts_t.view(-1, 1)
+                        elif ts_t.ndim == 2 and ts_t.shape[1] != 1:
+                            ts_t = ts_t[:, :1]
+                        else:
+                            ts_t = ts_t.view(-1, 1)
+                    
+                        # cast to match timestamp dtype if needed
+                        if ts_t.dtype != adjtimestamp.dtype:
+                            ts_t = ts_t.to(adjtimestamp.dtype)
+                    
+                        adj.masked_fill_(adjtimestamp >= ts_t, -1)
+
+            # fanout sampling
+            if adj.shape[1] > fanout:
+                rank_val = torch.rand_like(adj, dtype=torch.float)
+                rank_val.masked_fill_(adj < 0, -1000.0)
+                topk_ind = torch.topk(rank_val, fanout, dim=-1)[1]
+                adj = torch.gather(adj, 1, topk_ind)
+                rootnode = rootnode[:, :fanout]
+
+            mask = adj >= 0
+            rootnode, adj = rootnode[mask], adj[mask]
+            if len(rootnode) == 0:
+                continue
+
+            ret[key] = torch.stack((rootnode, adj), dim=0)
+        return ret
+
+
+def edgename2tail(edgename: str):
+    if edgename.startswith("head of "):
+        return edgename.split(":")[-1]
+    elif edgename.startswith("tail of "):
+        return edgename.split(":")[0].removeprefix("tail of ")
+    else:
+        raise NotImplementedError(f"cannot parse edgename: {edgename}")
+
+
+def edgename2head(edgename: str):
+    if edgename.startswith("head of "):
+        return edgename.split(":")[0].removeprefix("head of ")
+    elif edgename.startswith("tail of "):
+        return edgename.split(":")[-1]
+    else:
+        raise NotImplementedError(f"cannot parse edgename: {edgename}")
+
+
+class Graph:
+    def __init__(self, path) -> None:
+        with open(osp.join(path, "metanode.yaml")) as f:
+            metanode = yaml.safe_load(f)
+        with open(osp.join(path, "metaadj.yaml")) as f:
+            metaadj = yaml.safe_load(f)
+
+        for nodetype in metanode:
+            metanode[nodetype].update(metaadj.get(nodetype, {}))
+            metanode[nodetype]["name"] = nodetype  # for nicer error messages
+
+        self.metanode = metanode
+
+        # Robust torch.load across different torch versions
+        def _safe_load_pt(fp: str):
+            try:
+                return torch.load(fp, map_location="cpu", weights_only=True)
+            except TypeError:
+                return torch.load(fp, map_location="cpu")
+
+        self.edgenameemb = _safe_load_pt(osp.join(path, "edgenameemb.pt"))
+        self.featnameemb = _safe_load_pt(osp.join(path, "featnameemb.pt"))
+
+        # Inject "fewshot" edge embedding if missing
+        if "fewshot" not in self.edgenameemb:
+            # infer dim from any existing embedding
+            any_key = next(iter(self.edgenameemb.keys()))
+            dim = int(self.edgenameemb[any_key].numel())
+            self.edgenameemb["fewshot"] = torch.zeros(dim, dtype=self.edgenameemb[any_key].dtype)
+            warnings.warn("[WARN] edgenameemb missing 'fewshot' -> injected zeros embedding")
+
+        self.nodes = {}
+
+        # Load normal nodes
+        for nodetype in self.metanode:
+            feat_path = osp.join(path, "node", nodetype, "feat")
+            text_path = osp.join(path, "node", nodetype, "textemb")
+            adj_path = osp.join(path, "edge", nodetype, "adj")
+
+            # feat can be save_to_disk, shard_*, or arrow shards
+            feat_ds = load_hf_folder(feat_path).with_format("torch")
+
+            # textemb optional
+            text_ds = None
+            if osp.exists(text_path):
+                text_ds = load_hf_folder(text_path).with_format("torch")
+
+            # adj optional depending on edges
+            adj_ds = None
+            if len(self.metanode[nodetype].get("in", []) + self.metanode[nodetype].get("out", [])) > 0:
+                if osp.exists(adj_path):
+                    adj_ds = load_hf_folder(adj_path).with_format("torch")
+                else:
+                    self.metanode[nodetype]["in"] = []
+                    self.metanode[nodetype]["out"] = []
+                    adj_ds = None
+
+            self.nodes[nodetype] = Node(self.metanode[nodetype], feat_ds, text_ds, adj_ds)
+
+        # Ensure synthetic number node always exists (used for retrieval tasks)
+        self.ensure_number_node(num_needed=2)
+
+    def ensure_number_node(self, num_needed: int = 2):
+        """
+        Create (or expand) a synthetic node type "number" with EXACTLY ONE feature column.
+        This guarantees y.shape[1] == 1 in hloaderwrapper.py
+        """
+        num_needed = int(num_needed)
+        if num_needed < 2:
+            num_needed = 2
+
+        # If exists and has enough rows and exactly one feature, keep it.
+        if "number" in self.nodes:
+            meta = self.metanode.get("number", {})
+            featlist = meta.get("feat", [])
+            if len(featlist) == 1 and len(self.nodes["number"].feat) >= num_needed:
+                return
+
+        # Build dataset: one column Griffin_float_0 = [0..num_needed-1]
+        # Stored as torch tensors via set_format("torch") later.
+        ds = hds.Dataset.from_dict(
+            {"Griffin_float_0": list(range(num_needed))}
+        ).with_format("torch")
+
+        meta = {
+            "name": "number",
+            "num": len(ds),
+            "is_target": False,
+            "feat": ["Griffin_float_0"],
+            "in": [],
+            "out": [],
+        }
+        self.metanode["number"] = meta
+        self.nodes["number"] = Node(meta, ds, None, None)
+
+        # Also ensure featnameemb contains Griffin_float_0
+        if "Griffin_float_0" not in self.featnameemb:
+            any_key = next(iter(self.featnameemb.keys()))
+            dim = int(self.featnameemb[any_key].numel())
+            self.featnameemb["Griffin_float_0"] = torch.zeros(dim, dtype=self.featnameemb[any_key].dtype)
+
+    def subgraph(
+        self,
+        root_nodetype: str,
+        root_nodeidx: Iterable[int],
+        hop: int,
+        floatemb,
+        fanout: Union[int, list[int]] = INF,
+        timestamp: Union[list[int], None] = None,
+    ):
+        hastimestamp: bool = timestamp is not None
+        adj = {}
+        node = {}
+        root = {root_nodetype: root_nodeidx}
+        roottimestamp = {root_nodetype: timestamp}
+
+        # normalize fanout into per-hop list
+        if hop == 0:
+            fanout_list: list[int] = []
+        elif isinstance(fanout, int):
+            fanout_list = [fanout] * hop
+        else:
+            fanout_list = list(fanout)
+            if len(fanout_list) == 1 and hop > 1:
+                fanout_list = fanout_list * hop
+            if len(fanout_list) != hop:
+                raise ValueError(f"fanout list length must equal hop. hop={hop}, fanout={fanout_list}")
+
+        def dictgetlen(d: dict[str, torch.Tensor], key: str, dim: int = 0):
+            if key not in d:
+                return 0
+            return d[key].shape[dim]
+
+        def dictupdate(
+            d: dict[str, torch.Tensor],
+            key: str,
+            value: torch.Tensor,
+            concatdim: int = 0,
+        ):
+            if key not in d:
+                d[key] = value
+            else:
+                d[key] = torch.concat((d[key], value), dim=concatdim)
+            return d
+
+        for h in range(hop):
+            cur_fanout = fanout_list[h] if h < len(fanout_list) else INF
+            nroot, nroottimestamp = {}, {}
+            for nodetype in root:
+                found_src_num = dictgetlen(node, nodetype)
+                ttadj = self.nodes[nodetype].getedge(
+                    root[nodetype], cur_fanout, roottimestamp[nodetype]
+                )
+                for edgetype in ttadj:
+                    srcidx, taridx = ttadj[edgetype][0], ttadj[edgetype][1]
+
+                    tartype = edgename2tail(edgetype)
+                    found_tar_num = (
+                        dictgetlen(node, tartype)
+                        + dictgetlen(root, tartype)
+                        + dictgetlen(nroot, tartype)
+                    )
+
+                    if hastimestamp:
+                        base_ts = roottimestamp[nodetype]
+                    
+                        # convert to tensor
+                        if not torch.is_tensor(base_ts):
+                            base_ts = torch.as_tensor(base_ts)
+                    
+                        # ensure 1D
+                        if base_ts.ndim == 0:
+                            base_ts = base_ts.view(1)
+                    
+                        # index
+                        tartimestamp = base_ts[srcidx]
+                    
+                        # ensure result is 1D (never scalar)
+                        if tartimestamp.ndim == 0:
+                            tartimestamp = tartimestamp.view(1)
+                    
+                        nroottimestamp = dictupdate(nroottimestamp, tartype, tartimestamp)
+                    else:
+                        nroottimestamp[tartype] = None
+
+                    nroot = dictupdate(nroot, tartype, taridx)
+
+                    srcidx = srcidx + found_src_num
+                    taridx = torch.arange(taridx.shape[0], device=taridx.device) + found_tar_num
+
+                    adj = dictupdate(
+                        adj, edgetype, torch.stack((srcidx, taridx), dim=0), concatdim=1
+                    )
+
+            for nodetype in root:
+                node = dictupdate(node, nodetype, root[nodetype])
+
+            root = nroot
+            roottimestamp = nroottimestamp
+
+        for nodetype in root:
+            node = dictupdate(node, nodetype, root[nodetype])
+
+        root_len = len(_to_hf_index(root_nodeidx)) if not torch.is_tensor(root_nodeidx) else int(root_nodeidx.numel())
+        mapping = torch.arange(root_len, device=node[root_nodetype].device if torch.is_tensor(node.get(root_nodetype, None)) else torch.device("cpu"))
+
+
+        for nodetype in node:
+            node[nodetype] = self.nodes[nodetype].getfeat(node[nodetype], floatemb)
+
+        edgenameemb = {edgetype: self.edgenameemb[edgetype] for edgetype in adj}
+        nodenameemb = {
+            nodetype: torch.stack([self.featnameemb[_] for _ in self.nodes[nodetype].featlist], dim=0)
+            for nodetype in node
+        }
+
+        return node, adj, nodenameemb, edgenameemb, mapping
+
+    def fewshot(
+        self,
+        root_nodetype: str,
+        root_nodeidx: torch.LongTensor,
+        task_mask: torch.BoolTensor,
+        floatemb,
+        fanout: int = INF,
+        timestamp: Union[list[int], None] = None,
+        prefetch_factor: int = 10,
+    ):
+        assert fanout < INF, "always sample past"
+        idx = torch.randint(0, MAXINT64, (root_nodeidx.shape[0], prefetch_factor * fanout))
+        idx = idx % (root_nodeidx.clamp_min(1)).reshape(-1, 1)
+
+        if prefetch_factor > 1:
+            rootfeat = self.nodes[root_nodetype].getfeat(root_nodeidx, floatemb)
+            rootfeat[task_mask.unsqueeze(-1).expand(-1, -1, rootfeat.shape[-1])] = 0.0
+            feat = self.nodes[root_nodetype].getfeat(idx.flatten(), floatemb).unflatten(
+                0, (-1, prefetch_factor * fanout)
+            )
+            score = feat.flatten(-2, -1) @ rootfeat.flatten(-2, -1).unsqueeze(-1)
+            score = score.squeeze(-1)
+            idx = torch.gather(idx, 1, torch.topk(score, k=fanout, dim=-1)[1]).flatten()
+
+        idx = idx.flatten()
+        rootnode = torch.arange(root_nodeidx.shape[0]).repeat_interleave(fanout)
+        mask = root_nodeidx[rootnode] > 0
+        idx, rootnode = idx[mask], rootnode[mask]
+        return idx, rootnode
+
+
+class Task:
+    def __init__(self, path) -> None:
+        with open(osp.join(path, "metatask.yaml")) as f:
+            self.metatask = yaml.safe_load(f)
+
+        def _safe_load_pt(fp: str):
+            try:
+                return torch.load(fp, map_location="cpu", weights_only=True)
+            except TypeError:
+                return torch.load(fp, map_location="cpu")
+
+        self.tasknameemb = _safe_load_pt(osp.join(path, "tasknameemb.pt"))
+
+        self.tasks = {
+            taskname: load_hf_folder(osp.join(path, "task", taskname)).with_format("torch")
+            for taskname in self.metatask
+        }
+
+    def _slice_split(self, ds: hds.Dataset, meta: dict, split: str, idx_hf):
+        if split == "train":
+            return ds[idx_hf]
+        if split == "valid":
+            return ds[_to_hf_index((np.asarray(meta["split"][0]) + np.asarray(idx_hf)))]
+        if split == "test":
+            base = meta["split"][0] + meta["split"][1]
+            return ds[_to_hf_index((np.asarray(base) + np.asarray(idx_hf)))]
+        raise NotImplementedError
+
+    def get_retrieval(
+        self,
+        graph: Graph,
+        taskname: str,
+        split: Literal["train", "valid", "test"],
+        idx: Union[int, torch.Tensor, list[int], range],
+    ):
+        meta = self.metatask[taskname]
+        assert meta["task_type"] == "retrieval"
+        target_type = meta["target_type"]
+
+        idx_hf = _to_hf_index(idx)
+        taskinfo = self._slice_split(self.tasks[taskname], meta, split, idx_hf)
+
+        nodeidx = taskinfo["nodeidx"]
+        label = taskinfo["label"]
+        # IMPORTANT: cross_entropy expects [B] (NOT [B,1])
+        if torch.is_tensor(label) and label.ndim > 1:
+            label = label.view(-1)
+
+        timestamp = taskinfo["timestamp"] if meta.get("hastimestamp", False) else None
+
+        target_feat_mask = torch.tensor(
+            [_ not in meta["masked_feat"] for _ in graph.metanode[target_type]["feat"]],
+            dtype=torch.bool,
+        )
+
+        # Permanent fix: retrieval "seed_type" must be a 1-feature node => use "number"
+        num_class = int(meta["num_class"])
+        graph.ensure_number_node(num_needed=num_class)
+        seed_type = "number"
+
+        return (
+            target_type,
+            target_feat_mask,
+            nodeidx,
+            label,
+            timestamp,
+            self.tasknameemb[taskname],
+            (seed_type, num_class),
+        )
+
+    def get_regression(
+        self,
+        graph: Graph,
+        taskname: str,
+        split: Literal["train", "valid", "test"],
+        idx: Union[int, torch.Tensor, list[int], range],
+    ):
+        meta = self.metatask[taskname]
+        assert meta["task_type"] == "regression"
+        target_type = meta["target_type"]
+
+        idx_hf = _to_hf_index(idx)
+        taskinfo = self._slice_split(self.tasks[taskname], meta, split, idx_hf)
+
+        nodeidx = taskinfo["nodeidx"]
+        label = taskinfo["label"]
+        if torch.is_tensor(label) and label.ndim > 1:
+            label = label.view(-1)
+
+        timestamp = taskinfo["timestamp"] if meta.get("hastimestamp", False) else None
+
+        target_feat_mask = torch.tensor(
+            [_ not in meta["masked_feat"] for _ in graph.metanode[target_type]["feat"]],
+            dtype=torch.bool,
+        )
+        return (
+            target_type,
+            target_feat_mask,
+            nodeidx,
+            label,
+            timestamp,
+            self.tasknameemb[taskname],
+            (None, None),
+        )
+
+hmaintask_combine.py -
+import torch
+import torch.nn.functional as F
+from hdataset import Graph, Task
+from hloaderwrapper import LoaderWrapperTask
+from hmodel import GriffinMod
+from torch.utils.data import DataLoader
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
+from hFloatEmb import SimpleRepeater, getfloatdec
+import numpy as np
+import accelerate
+import argparse
+import os
+import os.path as osp
+import time
+import json
+from typing import Union, List
+from metric import compute_metric
+import yaml
+
+# =======================
+# Loss logging + plotting
+# =======================
+import csv
+import re
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# -----------------------
+# Helpers
+# -----------------------
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s))
+
+def _infer_db_name(dataset_path: str) -> str:
+    return osp.basename(dataset_path.rstrip("/"))
+
+def _to_float(x):
+    if x is None:
+        return None
+    if isinstance(x, (float, int)):
+        return float(x)
+    if torch.is_tensor(x):
+        return float(x.detach().cpu().item())
+    return float(x)
+
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def _plot_losses(csv_path: str, png_path: str):
+    epochs, tr, va = [], [], []
+    with open(csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            epochs.append(int(row["epoch"]))
+            tr.append(float(row["train_loss"]))
+            va.append(float(row["valid_loss"]))
+    if len(epochs) == 0:
+        return
+    plt.figure()
+    plt.plot(epochs, tr, label="train")
+    plt.plot(epochs, va, label="valid")
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=170)
+    plt.close()
+
+def seed_everything(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+
+
+# -----------------------
+# Dataset construction
+# -----------------------
+def construct_dataset(graph, task, tasknames, split, args, floatembmodel):
+    return LoaderWrapperTask(
+        graph,
+        batch_size=args.batchsize,
+        subgraphargs={"floatemb": floatembmodel, "fanout": args.fanout, "hop": args.hop},
+        shuffle=True if split == "train" else False,
+        task=task,
+        tasknames=tasknames,
+        split=split,
+        fewshotfanout=args.fewshotfanout,
+    )
+
+
+# -----------------------
+# Forward helpers
+# -----------------------
+def compute_output(model, dec, data):
+    label, y, mapping = data[-3:]
+    data = data[:-3]
+    if y is None:
+        output = dec(model(*data)[mapping])
+    else:
+        output = model(*data)[mapping] @ y.T
+    return output, label
+
+def compute_loss(model, dec, data):
+    label, y, mapping = data[-3:]
+    data = data[:-3]
+    if y is None:
+        output = dec(model(*data)[mapping])
+        loss = F.mse_loss(output.flatten(), label.flatten())
+    else:
+        output = model(*data)[mapping] @ y.T
+        loss = F.cross_entropy(output, label)
+    return loss
+
+
+# -----------------------
+# Eval: metric + optional logits save
+# -----------------------
+def eval_task_with_outputs(model, dec, dataset, accelerator, metric_name: str, save_outputs: bool = False):
+    """
+    Returns:
+      - metric_value (main proc only)
+      - outputs_np (main proc only if save_outputs)
+      - labels_np (main proc only if save_outputs)
+    """
+    model.eval()
+    dataset.rebuild_indice(accelerator)
+    batchsize: int = dataset.batch_size
+
+    loader = DataLoader(
+        dataset,
+        shuffle=False,
+        batch_size=1,
+        collate_fn=lambda xlist: xlist[0],
+        num_workers=8,
+        persistent_workers=False,
+    )
+    loader = accelerator.prepare(loader)
+
+    outputs_all = []
+    labels_all = []
+
+    with torch.no_grad():
+        for data in loader:
+            output, label = compute_output(model, dec, data)
+
+            # Pad to fixed batchsize so gather works
+            if output.shape[0] < batchsize:
+                padnum = batchsize - output.shape[0]
+                if torch.is_floating_point(label):
+                    label = torch.concat(
+                        (label, torch.empty_like(label[[0]].expand(padnum)).fill_(torch.nan)), dim=0
+                    )
+                else:
+                    label = torch.concat(
+                        (label, torch.empty_like(label[[0]].expand(padnum)).fill_(-1)), dim=0
+                    )
+                output = torch.concat(
+                    (output, torch.empty_like(output[[0]].expand(padnum, -1)).fill_(torch.nan)), dim=0
+                )
+
+            output, label = output.unsqueeze(0), label.unsqueeze(0)
+            output, label = accelerator.gather_for_metrics((output, label))
+            output, label = output.flatten(0, 1), label.flatten(0, 1)
+
+            if accelerator.is_main_process:
+                if torch.is_floating_point(label):
+                    mask = torch.isnan(label).logical_not_()
+                else:
+                    mask = label >= 0
+                output, label = output[mask], label[mask]
+                outputs_all.append(output.cpu())
+                labels_all.append(label.cpu())
+
+    if not accelerator.is_main_process:
+        return None, None, None
+
+    outputs_t = torch.concat(outputs_all, dim=0)
+    labels_t = torch.concat(labels_all, dim=0)
+    metric_val = compute_metric(outputs_t, labels_t, metric_name)
+
+    if save_outputs:
+        return metric_val, outputs_t.numpy(), labels_t.numpy()
+    return metric_val, None, None
+
+
+def eval_loss_epoch(model, dec, dataset, accelerator) -> Union[float, None]:
+    """
+    Average loss over a dataset split. Works for 1 or many processes.
+    """
+    model.eval()
+    dataset.rebuild_indice(accelerator)
+    loader = DataLoader(
+        dataset,
+        shuffle=False,
+        batch_size=1,
+        collate_fn=lambda xlist: xlist[0],
+        num_workers=8,
+        persistent_workers=False,
+    )
+    loader = accelerator.prepare(loader)
+
+    total_loss = 0.0
+    total_n = 0
+    with torch.no_grad():
+        for data in loader:
+            loss = compute_loss(model, dec, data)
+            total_loss += float(loss.detach().cpu().item())
+            total_n += 1
+
+    t = torch.tensor([total_loss, total_n], device=accelerator.device)
+    t = accelerator.gather_for_metrics(t).reshape(-1, 2)
+
+    if accelerator.is_main_process:
+        total_loss_all = t[:, 0].sum().item()
+        total_n_all = int(t[:, 1].sum().item())
+        return total_loss_all / max(total_n_all, 1)
+    return None
+
+
+def main(args):
+    repo_root = osp.dirname(osp.abspath(__file__))  # /workspace/Griffin
+    db_name = _safe_name(_infer_db_name(args.dataset))
+
+    # Create Graph/Task once (reused across seeds)
+    graph = Graph(args.dataset)
+    task = Task(args.dataset)
+
+    tasknames = args.tasks
+    if len(tasknames) == 1:
+        if tasknames[0] == "ALLTASK":
+            tasknames = [taskname for taskname in task.metatask]
+        elif tasknames[0] == "RETTASK":
+            tasknames = [t for t in task.metatask if task.metatask[t]["task_type"] == "retrieval"]
+        elif tasknames[0] == "REGTASK":
+            tasknames = [t for t in task.metatask if task.metatask[t]["task_type"] == "regression"]
+        elif tasknames[0].startswith("EXCEPT__"):
+            expect_taskname = tasknames[0][len("EXCEPT__"):]
+            tasknames = [t for t in task.metatask if t != expect_taskname]
+        elif tasknames[0] in ["commerce-1", "commerce-2", "others-1", "others-2"]:
+            with open("task_names.yaml", "r") as f:
+                tasks_dict = yaml.load(f, Loader=yaml.FullLoader)
+            tasknames = tasks_dict[tasknames[0]]
+
+    curve_task = tasknames[0]
+    task_name = _safe_name(curve_task)
+    metric_name = task.metatask[curve_task]["metric"]
+
+    # ---------- results root ----------
+    results_root = osp.join(repo_root, "results", db_name, task_name, str(args.hop))
+    _ensure_dir(results_root)
+
+    # ---------- run seeds ----------
+    seeds = args.seed
+    if isinstance(seeds, int):
+        seeds = [seeds]
+
+    summary_by_seed = {}
+
+    for seed in seeds:
+        seed = int(seed)
+        seed_everything(seed)
+
+        seed_dir = osp.join(results_root, f"seed_{seed}")
+        _ensure_dir(seed_dir)
+
+        loss_csv = osp.join(seed_dir, f"losses_{db_name}_{task_name}_seed{seed}.csv")
+        loss_png = osp.join(seed_dir, f"losses_{db_name}_{task_name}_seed{seed}.png")
+
+        with open(loss_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["epoch", "train_loss", "valid_loss", "valid_metric"])
+
+        ckpt_root = osp.join(repo_root, "checkpoints", _safe_name(args.logname), f"seed_{seed}")
+        _ensure_dir(ckpt_root)
+        best_ckpt_path = osp.join(ckpt_root, "best_checkpoint")
+
+        tbconfig = ProjectConfiguration(project_dir=args.logdir, logging_dir=args.logdir)
+        accelerator = Accelerator(log_with="tensorboard", project_config=tbconfig)
+        accelerator.init_trackers(f"{args.logname}_seed{seed}")
+        tbtracker = accelerator.get_tracker("tensorboard")
+
+        model = GriffinMod(hiddim=args.hiddim, num_mp=args.num_mp, use_rev=args.use_rev, use_gate=args.use_gate)
+        if args.loadpath is not None:
+            accelerate.load_checkpoint_in_model(model, args.loadpath)
+        dec = getfloatdec(args.hiddim)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+
+        floatembmodel = SimpleRepeater(args.hiddim)
+        train_dataset = construct_dataset(graph, task, tasknames, "train", args, floatembmodel)
+        valid_dataset_dict = {t: construct_dataset(graph, task, [t], "valid", args, floatembmodel) for t in tasknames}
+        test_dataset_dict  = {t: construct_dataset(graph, task, [t], "test",  args, floatembmodel) for t in tasknames}
+        metric_dict = {t: task.metatask[t]["metric"] for t in tasknames}
+
+        # BEST MODEL SELECTION: maximize validation metric
+        best_val_metric = -float("inf")
+        best_val_epoch = -1
+        best_val_loss_at_best_metric = None
+
+        # epoch traces
+        epoch_train_losses: List[float] = []
+        epoch_val_losses: List[float] = []
+        epoch_val_metrics: List[float] = []
+        epoch_val_metric_names: List[str] = []
+
+        model, dec, optimizer = accelerator.prepare(model, dec, optimizer)
+
+        # -----------------------
+        # TRAIN
+        # -----------------------
+        train_time_start = time.time()
+        step = 0
+
+        for epoch in range(args.maxepoch):
+            if accelerator.is_main_process:
+                print(f"[seed {seed}] Epoch {epoch} starts")
+
+            model.train()
+            train_dataset.rebuild_indice(accelerator)
+            loader = DataLoader(
+                train_dataset,
+                shuffle=True,
+                batch_size=1,
+                collate_fn=lambda xlist: xlist[0],
+                num_workers=16,
+                prefetch_factor=4,
+                persistent_workers=False,
+                pin_memory=True,
+            )
+            loader = accelerator.prepare(loader)
+
+            epoch_train_loss_sum = 0.0
+            epoch_train_steps = 0
+
+            for data in loader:
+                step += 1
+                optimizer.zero_grad()
+                loss = compute_loss(model, dec, data)
+
+                epoch_train_loss_sum += float(loss.detach().cpu().item())
+                epoch_train_steps += 1
+
+                accelerator.backward(loss)
+                optimizer.step()
+
+                if step % 100 == 0:
+                    tbtracker.log({"training_loss": loss}, step=step)
+
+            # avg train loss across processes
+            t = torch.tensor([epoch_train_loss_sum, epoch_train_steps], device=accelerator.device)
+            t = accelerator.gather_for_metrics(t).reshape(-1, 2)
+            train_loss_epoch = None
+            if accelerator.is_main_process:
+                train_loss_epoch = t[:, 0].sum().item() / max(int(t[:, 1].sum().item()), 1)
+
+            accelerator.wait_for_everyone()
+
+            # compute valid loss + valid metric for curve_task
+            valid_loss_epoch = eval_loss_epoch(model, dec, valid_dataset_dict[curve_task], accelerator)
+            val_metric_epoch, _, _ = eval_task_with_outputs(
+                model, dec, valid_dataset_dict[curve_task], accelerator, metric_dict[curve_task], save_outputs=False
+            )
+
+            if accelerator.is_main_process:
+                epoch_train_losses.append(float(train_loss_epoch))
+                epoch_val_losses.append(float(valid_loss_epoch))
+                epoch_val_metrics.append(float(val_metric_epoch))
+                epoch_val_metric_names.append(str(metric_dict[curve_task]))
+
+                with open(loss_csv, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([epoch, train_loss_epoch, valid_loss_epoch, _to_float(val_metric_epoch)])
+                _plot_losses(loss_csv, loss_png)
+
+                # =======================
+                # BEST update by VALID METRIC (maximize)
+                # =======================
+                if val_metric_epoch is not None and float(val_metric_epoch) > best_val_metric:
+                    best_val_metric = float(val_metric_epoch)
+                    best_val_epoch = int(epoch)
+                    best_val_loss_at_best_metric = _to_float(valid_loss_epoch)
+                    print(f"[seed {seed}] [BEST] epoch={epoch} val_metric={best_val_metric:.6f} -> save {best_ckpt_path}")
+                    accelerator.save_model(model, best_ckpt_path)
+
+            # optional logging for all tasks each eval_per_epoch
+            if (epoch + 1) % args.eval_per_epoch == 0:
+                if accelerator.is_main_process:
+                    print(f"[seed {seed}] Metric logging @ epoch {epoch} ...")
+                for tname in tasknames:
+                    mname = metric_dict[tname]
+                    metric_val, _, _ = eval_task_with_outputs(
+                        model, dec, valid_dataset_dict[tname], accelerator, mname, save_outputs=False
+                    )
+                    if accelerator.is_main_process:
+                        tbtracker.log({f"valid_metric/{tname}/{mname}": metric_val}, step=step)
+                        print(f"[seed {seed}] valid_metric/{tname}/{mname}: {metric_val}", flush=True)
+
+        train_time_sec = time.time() - train_time_start
+
+        # -----------------------
+        # LOAD BEST + TEST
+        # -----------------------
+        if osp.exists(best_ckpt_path):
+            if accelerator.is_main_process:
+                print(f"[seed {seed}] Loading best checkpoint from {best_ckpt_path} (best_val_epoch={best_val_epoch}, best_val_metric={best_val_metric:.6f})")
+            unwrap_model = accelerator.unwrap_model(model)
+            accelerate.load_checkpoint_in_model(unwrap_model, best_ckpt_path)
+            model = accelerator.prepare(unwrap_model)
+        else:
+            if accelerator.is_main_process:
+                print(f"[seed {seed}] [WARN] No best checkpoint saved. Using last model state.")
+
+        # Save logits for best-ckpt validation + test
+        val_outputs_paths = []
+        test_outputs_paths = []
+
+        # validation outputs (best ckpt)
+        val_metric_best, val_logits, val_labels = eval_task_with_outputs(
+            model, dec, valid_dataset_dict[curve_task], accelerator, metric_dict[curve_task], save_outputs=True
+        )
+        val_loss_best = eval_loss_epoch(model, dec, valid_dataset_dict[curve_task], accelerator)
+
+        if accelerator.is_main_process:
+            val_npz = osp.join(seed_dir, "val_outputs_best.npz")
+            np.savez(val_npz, logits=val_logits, labels=val_labels)
+            val_outputs_paths.append(val_npz)
+
+        # test outputs (best ckpt)
+        test_time_start = time.time()
+        test_metric, test_logits, test_labels = eval_task_with_outputs(
+            model, dec, test_dataset_dict[curve_task], accelerator, metric_dict[curve_task], save_outputs=True
+        )
+        test_time_sec = time.time() - test_time_start
+        test_loss = eval_loss_epoch(model, dec, test_dataset_dict[curve_task], accelerator)
+
+        if accelerator.is_main_process:
+            test_npz = osp.join(seed_dir, "test_outputs_best.npz")
+            np.savez(test_npz, logits=test_logits, labels=test_labels)
+            test_outputs_paths.append(test_npz)
+
+        # -----------------------
+        # JSON per seed
+        # -----------------------
+        if accelerator.is_main_process:
+            seed_payload = {
+                "db": str(db_name),
+                "task": str(curve_task),
+                "task_type": str(task.metatask[curve_task].get("task_type", "")),
+                "seed": int(seed),
+
+                "best_val_epoch": int(best_val_epoch),
+                "best_val_metric_name": str(metric_dict[curve_task]),
+                "best_val_metric": float(best_val_metric) if best_val_epoch >= 0 else None,
+                "best_val_loss_at_best_metric_epoch": _to_float(best_val_loss_at_best_metric),
+
+                "val_metric_name": str(metric_dict[curve_task]),
+                "val_metric": _to_float(val_metric_best),
+                "val_loss_avg_task_loss": _to_float(val_loss_best),
+
+                "test_metric_name": str(metric_dict[curve_task]),
+                "test_metric": _to_float(test_metric),
+                "test_loss_avg_task_loss": _to_float(test_loss),
+
+                "train_time_sec": float(train_time_sec),
+                "test_time_sec": float(test_time_sec),
+
+                "epoch_train_losses": [float(x) for x in epoch_train_losses],
+                "epoch_val_losses": [float(x) for x in epoch_val_losses],
+                "epoch_val_metrics": [float(x) for x in epoch_val_metrics],
+                "epoch_val_metric_names": [str(x) for x in epoch_val_metric_names],
+
+                "best_ckpt_path": str(best_ckpt_path) if osp.exists(best_ckpt_path) else None,
+                "saved_val_outputs": val_outputs_paths,
+                "saved_test_outputs": test_outputs_paths,
+
+                "config": {
+                    "batchsize": int(args.batchsize),
+                    "eval_batchsize": int(args.eval_batchsize),
+                    "lr": float(args.lr),
+                    "wd": float(args.wd),
+                    "maxepoch": int(args.maxepoch),
+                    "eval_per_epoch": int(args.eval_per_epoch),
+                    "hop": int(args.hop),
+                    "fanout": list(args.fanout) if isinstance(args.fanout, list) else args.fanout,
+                    "fewshotfanout": int(args.fewshotfanout),
+                    "num_mp": int(args.num_mp),
+                    "hiddim": int(args.hiddim),
+                    "use_rev": bool(args.use_rev),
+                    "use_gate": bool(args.use_gate),
+                    "dataset": str(args.dataset),
+                    "logdir": str(args.logdir),
+                    "logname": str(args.logname),
+                    "tasks": [str(x) for x in args.tasks],
+                    "loadpath": str(args.loadpath) if args.loadpath is not None else None,
+                },
+            }
+
+            with open(osp.join(seed_dir, "results.json"), "w") as f:
+                json.dump(seed_payload, f, indent=2)
+
+            summary_by_seed[str(seed)] = {
+                "best_val_epoch": int(best_val_epoch),
+                "best_val_metric": float(best_val_metric) if best_val_epoch >= 0 else None,
+                "metric_name": str(metric_dict[curve_task]),
+                "test_metric": _to_float(test_metric),
+                "best_ckpt_path": str(best_ckpt_path) if osp.exists(best_ckpt_path) else None,
+                "seed_dir": seed_dir,
+            }
+
+        accelerator.end_training()
+
+    # Summary JSON
+    if len(summary_by_seed) > 0:
+        summary_path = osp.join(results_root, "summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(
+                {
+                    "db": db_name,
+                    "task": curve_task,
+                    "metric_name": metric_name,
+                    "seeds": summary_by_seed,
+                },
+                f,
+                indent=2,
+            )
+        print(f"[RESULTS] Saved summary: {summary_path}")
+        print(f"[RESULTS] Root: {results_root}")
+
+
+if __name__ == "__main__":
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if str(v).lower() in ("yes", "true", "t", "y", "1"):
+            return True
+        elif str(v).lower() in ("no", "false", "f", "n", "0"):
+            return False
+        else:
+            raise argparse.ArgumentTypeError("Boolean value expected.")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default="train", help="train or test")
+    parser.add_argument("dataset", type=str)
+    parser.add_argument("logdir", type=str)
+    parser.add_argument("logname", type=str)
+
+    parser.add_argument("--tasks", type=str, nargs="+", default=["ALLTASK"])
+    parser.add_argument("--savepath", type=str, default=None)   # kept for compatibility
+    parser.add_argument("--loadpath", type=str, default=None)
+
+    # allow multiple seeds: --seed 0 1 2
+    parser.add_argument("--seed", type=int, nargs="+", default=[0])
+
+    parser.add_argument("--batchsize", type=int, default=512)
+    parser.add_argument("--eval_batchsize", type=int, default=None)
+
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--wd", type=float, default=4e-4)
+    parser.add_argument("--maxepoch", type=int, default=10)
+    parser.add_argument("--eval_per_epoch", type=int, default=3)
+
+    parser.add_argument("--num_mp", type=int, default=4)
+    parser.add_argument("--hiddim", type=int, default=256)
+
+    # per-hop fanout
+    parser.add_argument(
+        "--fanout", type=int, nargs="*", default=None,
+        help="Per-hop fanout list. hop=0 -> omit, hop=1 -> --fanout 10, hop=2 -> --fanout 10 30"
+    )
+    parser.add_argument("--fewshotfanout", type=int, default=0)
+    parser.add_argument("--hop", type=int, default=2)
+    parser.add_argument("--use_rev", type=str2bool, default=True)
+    parser.add_argument("--use_gate", type=str2bool, default=True)
+
+    args = parser.parse_args()
+
+    # normalize fanout list to match hop
+    if args.hop == 0:
+        args.fanout = []
+    else:
+        if args.fanout is None or len(args.fanout) == 0:
+            args.fanout = [10] * args.hop
+        elif len(args.fanout) == 1 and args.hop > 1:
+            args.fanout = args.fanout * args.hop
+        elif len(args.fanout) != args.hop:
+            raise ValueError(f"--fanout must have length == --hop. Got hop={args.hop}, fanout={args.fanout}")
+
+    args.eval_batchsize = args.batchsize if args.eval_batchsize is None else args.eval_batchsize
+
+    main(args)
+
+hloaderwrapper.py -
+
+from hdataset import Graph, INF, edgename2head, edgename2tail, Task
+from hFloatEmb import SimpleRepeater
+import torch
+import numpy as np
+import torch.nn.functional as F
+import torch.distributed
+from typing import Literal
+import accelerate
+import copy
+
+def unifyheterograph(rootnodetype, node, nodenameemb, edgenameemb, adj):
+    assert rootnodetype in node
+    nodetypes = [rootnodetype] + list([_ for _ in node.keys() if _ != rootnodetype])
+    nodeptr = [0] + [node[nodetype].shape[0] for nodetype in nodetypes]
+    nodeptr = np.cumsum(nodeptr)
+    node = [(nodenameemb[nodetype], node[nodetype])  for nodetype in nodetypes]
+    
+    edgetypes = list(adj.keys())
+    # print("loader: ", edgetypes, nodeptr, nodetypes)
+    if len(edgetypes) > 0:
+        edge_attr = torch.stack([edgenameemb[edgetype] for edgetype in edgetypes], dim=0)
+        edge_index = []
+        edge_attr_type = []
+        for i, edgetype in enumerate(edgetypes):
+            head, tail = edgename2head(edgetype), edgename2tail(edgetype)
+            row = nodeptr[nodetypes.index(head)] + adj[edgetype][0]
+            col = nodeptr[nodetypes.index(tail)] + adj[edgetype][1]
+            attr = torch.zeros_like(row).fill_(i)
+            edge_index.append(torch.stack((row, col), dim=0))
+            edge_attr_type.append(attr)
+        edge_index = torch.concat(edge_index, dim=1)
+        edge_attr_type = torch.concat(edge_attr_type, dim=0)
+    else:
+        edge_attr, edge_index, edge_attr_type = None, None, None
+    return node, edge_index, edge_attr_type, edge_attr
+
+def mergefewshotgraph(node, edge_index, edge_attr_type, edge_attr, fewshotnode, fewshotedge_index, fewshotedge_attr_type, fewshotedge_attr, tarnode, fewshotrelemb):
+    # combine graph and few shot graph
+    lennode = sum([_[1].shape[0] for _ in node])
+    if fewshotedge_index is not None:
+        fewshotedge_index += lennode
+        fewshotedge_attr_type += edge_attr.shape[0]    
+
+    if edge_index is None:
+        assert fewshotedge_index is None
+        edge_index = torch.stack((tarnode, lennode+torch.arange(tarnode.shape[0])), dim=0)
+        edge_attr_type = torch.zeros_like(tarnode)
+        edge_attr = fewshotrelemb.reshape(1, -1)
+    else:
+        if fewshotedge_index is not None:
+            edge_index = torch.concat((edge_index, fewshotedge_index, torch.stack((tarnode, lennode+torch.arange(tarnode.shape[0])), dim=0)), dim=1)
+            edge_attr_type = torch.concat((edge_attr_type, fewshotedge_attr_type, torch.zeros_like(tarnode) + (edge_attr.shape[0]+fewshotedge_attr.shape[0])), dim=0)
+            edge_attr = torch.concat((edge_attr, fewshotedge_attr, fewshotrelemb.reshape(1, -1)), dim=0)
+        else:
+            edge_index = torch.concat((edge_index, torch.stack((tarnode, lennode+torch.arange(tarnode.shape[0])), dim=0)), dim=1)
+            edge_attr_type = torch.concat((edge_attr_type, torch.zeros_like(tarnode) + edge_attr.shape[0]), dim=0)
+            edge_attr = torch.concat((edge_attr, fewshotrelemb.reshape(1, -1)), dim=0)    
+    node = node + fewshotnode
+    return node, edge_index, edge_attr_type, edge_attr
+
+def scalefeat(node, taskfeat, edge_attr, y=None):
+    dim = node[0][0].shape[-1]
+    shape = (dim,)
+    for i in range(len(node)):
+        node[i] = (F.layer_norm(node[i][0], shape), F.layer_norm(node[i][1], shape))
+        taskfeat[i] = None if taskfeat[i] is None else F.layer_norm(taskfeat[i], shape)
+    if edge_attr is not None:
+        edge_attr = F.layer_norm(edge_attr, shape)
+    if y is not None:
+        y = F.layer_norm(y, shape)
+    return node, taskfeat, edge_attr, y
+
+def buildindice(shuffle, lens, batch_size):
+    ind = []
+    if not shuffle:
+        for nodetypeidx, (_, num) in enumerate(lens):
+            leftnum = num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            idx = torch.arange(num+padnum)
+            idx[num:] = -1
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    else:
+        for nodetypeidx, (_, num) in enumerate(lens):
+            leftnum = num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            idx = torch.arange(num+padnum)
+            idx[num:] = -1
+            idx = idx[torch.randperm(idx.shape[0])]
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    return torch.cat(ind, dim=0) # shuffle within nodetype. node type not shuffled, left for dataloader shuffle
+
+def buildindice_downsample(shuffle, lens, batch_size, downsample_ratio, downsample_seed=42):
+    ind = []
+    if not shuffle:
+        for nodetypeidx, (_, num) in enumerate(lens):
+            leftnum = num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            idx = torch.arange(num+padnum)
+            idx[num:] = -1
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    else:
+        for nodetypeidx, (_, num) in enumerate(lens):
+            sample_num = int(num * downsample_ratio)
+            leftnum = sample_num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            # The first part is the sample part, with sample_num elements ranging from 0 to num-1
+            # the second part is the padding part, with padnum elements with value -1
+            rng = np.random.RandomState(downsample_seed)
+            sampled_indices = torch.from_numpy(rng.permutation(num)[:sample_num])
+            idx = torch.cat([sampled_indices, torch.full((padnum,), -1)])
+            idx = idx[torch.randperm(idx.shape[0])]
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    return torch.cat(ind, dim=0) # shuffle within nodetype. node type not shuffled, left for dataloader shuffle
+
+def buildindice_downsample_absolute(shuffle, lens, batch_size, downsample_num, downsample_seed=42):
+    ind = []
+    if not shuffle:
+        for nodetypeidx, (_, num) in enumerate(lens):
+            leftnum = num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            idx = torch.arange(num+padnum)
+            idx[num:] = -1
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    else:
+        for nodetypeidx, (_, num) in enumerate(lens):
+            if downsample_num > num:
+                if _ == "rel-f1-driver-top3":
+                    downsample_num = 1024
+                else:
+                    raise ValueError(f"downsample_num {downsample_num} is greater than num {num}")
+            sample_num = downsample_num
+            leftnum = sample_num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            # The first part is the sample part, with sample_num elements ranging from 0 to num-1
+            # the second part is the padding part, with padnum elements with value -1
+            rng = np.random.RandomState(downsample_seed)
+            sampled_indices = torch.from_numpy(rng.permutation(num)[:sample_num])
+            idx = torch.cat([sampled_indices, torch.full((padnum,), -1)])
+            idx = idx[torch.randperm(idx.shape[0])]
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    return torch.cat(ind, dim=0) # shuffle within nodetype. node type not shuffled, left for dataloader shuffle
+
+def buildindice_sample(shuffle, lens, batch_size, sample_config, sample_seed=42):
+    ind = []
+    if not shuffle:
+        for nodetypeidx, (_, num) in enumerate(lens):
+            leftnum = num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            idx = torch.arange(num+padnum)
+            idx[num:] = -1
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    else:
+        for nodetypeidx, (taskname, num) in enumerate(lens):
+            task_config = sample_config.get(taskname, sample_config["default"])
+            if task_config is None:
+                raise ValueError(f"task {taskname} not found in sample_config")
+            sample_num = int(num * task_config)
+            leftnum = sample_num % batch_size
+            padnum = 0 if leftnum == 0 else batch_size - leftnum
+            # The first part is the sample part, with sample_num elements ranging from 0 to num-1
+            # the second part is the padding part, with padnum elements with value -1
+            rng = np.random.RandomState(sample_seed)
+            # generate random indices. With range in [0, num-1], sample_num elements
+            sampled_indices = torch.from_numpy(np.random.randint(0, num, sample_num))
+            # sampled_indices = torch.from_numpy(rng.permutation(num)[:sample_num])
+            idx = torch.cat([sampled_indices, torch.full((padnum,), -1)])
+            idx = idx[torch.randperm(idx.shape[0])]
+            idx = idx.reshape(-1, batch_size)
+            idx = torch.concat((idx[:, [0]].clone().fill_(nodetypeidx), idx), dim=-1)
+            ind.append(idx)
+    return torch.cat(ind, dim=0) # shuffle within nodetype. node type not shuffled, left for dataloader shuffle
+
+
+class LoaderWrapper:
+
+    def __init__(self, graph: Graph, batch_size: int, shuffle: bool, subgraphargs: dict[str], fewshotfanout: int) -> None:
+        self.prefetch_factor = 1
+        self.fewshotfanout = fewshotfanout
+        self.graph = graph
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.subgraphargs = subgraphargs
+        self.lens = [(nodetype, self.graph.metanode[nodetype]["num"]) for nodetype in self.graph.metanode]
+        self.ind = None
+    
+    def rebuild_indice(self, accelerator: accelerate.Accelerator):
+        if accelerator.is_main_process:
+            self.ind = buildindice(self.shuffle, self.lens, self.batch_size)
+        self.ind = accelerate.utils.broadcast_object_list([self.ind], from_process=0)[0]
+    
+    def rebuild_indice_downsample(self, accelerator: accelerate.Accelerator, downsample_ratio: float, downsample_seed: int):
+        if accelerator.is_main_process:
+            self.ind = buildindice_downsample(self.shuffle, self.lens, self.batch_size, downsample_ratio, downsample_seed)
+        self.ind = accelerate.utils.broadcast_object_list([self.ind], from_process=0)[0]
+    
+    def rebuild_indice_downsample_absolute(self, accelerator: accelerate.Accelerator, downsample_num: int, downsample_seed: int):
+        if accelerator.is_main_process:
+            self.ind = buildindice_downsample_absolute(self.shuffle, self.lens, self.batch_size, downsample_num, downsample_seed)
+        self.ind = accelerate.utils.broadcast_object_list([self.ind], from_process=0)[0]
+    
+    def rebuild_indice_sample(self, accelerator: accelerate.Accelerator, sample_config, sample_seed: int):
+        if accelerator.is_main_process:
+            self.ind = buildindice_sample(self.shuffle, self.lens, self.batch_size, sample_config, sample_seed)
+        self.ind = accelerate.utils.broadcast_object_list([self.ind], from_process=0)[0]
+    
+    def __len__(self):
+        assert self.ind is not None, "please rebuild_indice first"
+        return self.ind.shape[0]
+
+    def subgraph(self, nodetype, ind, timestamp=None):
+        return self.graph.subgraph(nodetype, ind, **self.subgraphargs, timestamp=timestamp)
+
+    def fewshotsubgraph(self, nodetype, ind, timestamp=None):
+        tmpargs = copy.copy(self.subgraphargs)
+        tmpargs["hop"] = 0
+        return self.graph.subgraph(nodetype, ind, **tmpargs, timestamp=timestamp)
+
+    def fewshotroot(self, rootnodetype, tind, taskmask, roottimestamp=None):
+        return self.graph.fewshot(rootnodetype, tind, taskmask, self.subgraphargs["floatemb"], self.fewshotfanout, roottimestamp, prefetch_factor=self.prefetch_factor)
+
+    def __getitem__(self, idx:int):        
+        tind = self.ind[idx]
+        nodetype = self.lens[tind[0].item()][0]
+        tind = tind[1:]
+        tind = tind[tind>=0]
+
+        node, adj, nodenameemb, edgenameemb, mapping = self.subgraph(nodetype, tind)
+        node, edge_index, edge_attr_type, edge_attr = unifyheterograph(nodetype, node, nodenameemb, edgenameemb, adj)
+
+        yidx = [torch.randint(0, node[i][1].shape[1], (node[i][1].shape[0],)) for i in range(len(node))]
+        taskfeat = [node[i][0][yidx[i]] for i in range(len(node))]
+        y = [node[i][1][torch.arange(node[i][1].shape[0]), yidx[i]] for i in range(len(node))]
+        mask = [F.one_hot(yidx[i], num_classes=node[i][1].shape[1]).to(torch.bool) for i in range(len(node))]
+        
+        y = torch.concat(y, dim=0)
+
+        node, taskfeat, edge_attr, y = scalefeat(node, taskfeat, edge_attr, y)
+        
+        return  node, mask, taskfeat, edge_index, edge_attr_type, edge_attr, y
+
+
+
+class LoaderWrapperCompletion(LoaderWrapper):
+
+    def __init__(self, graph: Graph, batch_size: int, shuffle: bool, subgraphargs: dict[str], fewshotfanout: int) -> None:
+        super().__init__(graph, batch_size, shuffle, subgraphargs, fewshotfanout)
+        self.lens = [(nodetype, self.graph.metanode[nodetype]["num"]) for nodetype in self.graph.metanode if len(self.graph.metanode[nodetype]["feat"])>1]
+
+    def __getitem__(self, idx:int):
+        tind = self.ind[idx]
+        rootnodetype = self.lens[tind[0].item()][0]
+        tind = tind[1:]
+        tind = tind[tind>=0]
+
+        roottimestamp = self.graph.nodes[rootnodetype].feat[tind]["timestamp"]
+
+        node, adj, nodenameemb, edgenameemb, mapping = self.subgraph(rootnodetype, tind, roottimestamp)
+
+        node, edge_index, edge_attr_type, edge_attr = unifyheterograph(rootnodetype, node, nodenameemb, edgenameemb, adj)
+
+        yidx = torch.randint(0, node[0][1].shape[1], (node[0][1].shape[0],))
+        taskfeat = [node[0][0][yidx]]+ [None for i in range(len(node)-1)]
+        y = node[0][1][torch.arange(node[0][1].shape[0]), yidx]
+        mask = [F.one_hot(yidx, num_classes=node[0][1].shape[1]).to(torch.bool)] + [None for i in range(len(node)-1)]
+
+        if self.fewshotfanout > 0:
+            fewshot_center, tarnode = self.fewshotroot(rootnodetype, tind, mask[0], roottimestamp)
+
+            fewshotnode, fewshotadj, fewshotnodenameemb, fewshotedgenameemb, fewshotmapping = self.fewshotsubgraph(rootnodetype, fewshot_center, None if roottimestamp is None else roottimestamp[tarnode])
+            fewshotnode, fewshotedge_index, fewshotedge_attr_type, fewshotedge_attr = unifyheterograph(rootnodetype, fewshotnode, fewshotnodenameemb, fewshotedgenameemb, fewshotadj)
+
+            node, edge_index, edge_attr_type, edge_attr = mergefewshotgraph(node, edge_index, edge_attr_type, edge_attr, fewshotnode, fewshotedge_index, fewshotedge_attr_type, fewshotedge_attr, tarnode, self.graph.edgenameemb["fewshot"])
+            
+            taskfeat = taskfeat + [taskfeat[0][tarnode]] + [None for i in range(len(fewshotnode)-1)]
+
+            mask = mask + [None] * len(fewshotnode)
+
+        node, taskfeat, edge_attr, y = scalefeat(node, taskfeat, edge_attr, y)
+        
+        return  node, mask, taskfeat, edge_index, edge_attr_type, edge_attr, y
+
+
+
+class LoaderWrapperRetrieval(LoaderWrapper):
+
+    def __init__(self, graph: Graph, batch_size: int, shuffle: bool, subgraphargs: dict[str], task: Task, tasknames: list[str], split: Literal["train", "valid", "test"], fewshotfanout: int) -> None:
+        super().__init__(graph, batch_size, shuffle, subgraphargs, fewshotfanout)
+        assert len(tasknames) > 0, "please provide task name"
+        self.task = task
+        self.lens = [(taskname, self.task.metatask[taskname]["split"][{"train":0, "valid": 1, "test": 2}[split]]) for i, taskname in enumerate(tasknames)]
+        self.split = split
+
+    def __getitem__(self, idx:int):
+        tind = self.ind[idx]
+        taskname = self.lens[tind[0].item()][0]
+        tind = tind[1:]
+        tind = tind[tind>=0]
+
+        nodetype, target_feat_mask, tind, label, tasktimestamp, tasknameemb, (seed_type, num_class) = self.task.get_retrieval(self.graph, taskname, self.split, tind)
+
+        y = self.graph.nodes[seed_type].getfeat(range(num_class), self.subgraphargs["floatemb"])
+        assert y.shape[1] == 1
+        y = y.squeeze_(1)
+
+        node, adj, nodenameemb, edgenameemb, mapping = self.subgraph(nodetype, tind)
+        node[nodetype] = node[nodetype][:, target_feat_mask]
+        nodenameemb[nodetype] = nodenameemb[nodetype][target_feat_mask]
+
+
+        node, edge_index, edge_attr_type, edge_attr = unifyheterograph(nodetype, node, nodenameemb, edgenameemb, adj)
+
+
+        taskfeat = [tasknameemb for i in range(len(node))]
+        mask = [None for i in range(len(node))]
+        
+        node, taskfeat, edge_attr = scalefeat(node, taskfeat, edge_attr)
+        
+        return  node, mask, taskfeat, edge_index, edge_attr_type, edge_attr, label, y, mapping
+
+
+
+class LoaderWrapperRegression(LoaderWrapper):
+
+    def __init__(self, graph: Graph, batch_size: int, shuffle: bool, subgraphargs: dict[str], task: Task, tasknames: list[str], split: Literal["train", "valid", "test"], fewshotfanout: int) -> None:
+        super().__init__(graph, batch_size, shuffle, subgraphargs, fewshotfanout)
+        assert len(tasknames) > 0, "please provide task name"
+        self.task = task
+        self.lens = [(taskname, self.task.metatask[taskname]["split"][{"train":0, "valid": 1, "test": 2}[split]]) for i, taskname in enumerate(tasknames)]
+        self.split = split
+
+    def __getitem__(self, idx:int):
+        tind = self.ind[idx]
+        taskname = self.lens[tind[0].item()][0]
+        tind = tind[1:]
+        tind = tind[tind>=0]
+
+        nodetype, target_feat_mask, tind, label, tasktimestamp, tasknameemb, _ = self.task.get_regression(self.graph, taskname, self.split, tind)
+
+        node, adj, nodenameemb, edgenameemb, mapping = self.subgraph(nodetype, tind)
+        node[nodetype] = node[nodetype][:, target_feat_mask]
+        nodenameemb[nodetype] = nodenameemb[nodetype][target_feat_mask]
+
+
+        node, edge_index, edge_attr_type, edge_attr = unifyheterograph(nodetype, node, nodenameemb, edgenameemb, adj)
+
+
+        taskfeat = [tasknameemb for i in range(len(node))]
+        mask = [None for i in range(len(node))]
+        
+        node, taskfeat, edge_attr = scalefeat(node, taskfeat, edge_attr)
+        
+        return  node, mask, taskfeat, edge_index, edge_attr_type, edge_attr, label, mapping
+
+
+
+class LoaderWrapperTask(LoaderWrapper):
+
+    def __init__(self, graph: Graph, batch_size: int, shuffle: bool, subgraphargs: dict[str], task: Task, tasknames: list[str], split: Literal["train", "valid", "test"], fewshotfanout: int) -> None:
+        super().__init__(graph, batch_size, shuffle, subgraphargs, fewshotfanout)
+        assert len(tasknames) > 0, "please provide task name"
+        self.task = task
+        self.lens = [(taskname, self.task.metatask[taskname]["split"][{"train":0, "valid": 1, "test": 2}[split]]) for i, taskname in enumerate(tasknames)]
+        self.split = split
+
+    def __getitem__(self, idx:int):
+        tind = self.ind[idx]
+        taskname = self.lens[tind[0].item()][0]
+        tind = tind[1:]
+        tind = tind[tind>=0]
+
+        is_regression = self.task.metatask[taskname]["task_type"] == "regression"
+
+        if is_regression:
+            rootnodetype, target_feat_mask, tind, label, tasktimestamp, tasknameemb, _ = self.task.get_regression(self.graph, taskname, self.split, tind)
+            y = None
+        else:
+            rootnodetype, target_feat_mask, tind, label, tasktimestamp, tasknameemb, (seed_type, num_class) = self.task.get_retrieval(self.graph, taskname, self.split, tind)
+            y = self.graph.nodes[seed_type].getfeat(range(num_class), self.subgraphargs["floatemb"])
+            assert y.shape[1] == 1
+            y = y.squeeze_(1)
+        
+        node, adj, nodenameemb, edgenameemb, mapping = self.subgraph(rootnodetype, tind, tasktimestamp)
+        #node[nodetype] = node[nodetype][:, target_feat_mask]
+        #nodenameemb[nodetype] = nodenameemb[nodetype][target_feat_mask]
+
+        node, edge_index, edge_attr_type, edge_attr = unifyheterograph(rootnodetype, node, nodenameemb, edgenameemb, adj)
+
+        taskfeat = [tasknameemb for i in range(len(node))]
+        mask = [None for i in range(len(node))]
+        mask[0] = torch.zeros(node[0][1].shape[:2], dtype=torch.bool)
+        mask[0][mapping] = torch.logical_not(target_feat_mask)
+        # [F.one_hot(labelidx[i], num_classes=node[i][1].shape[1]).to(torch.bool) for i in range(len(node))]
+        
+        if self.fewshotfanout > 0:
+            fewshot_center, tarnode = self.fewshotroot(rootnodetype, tind, mask[0][mapping], tasktimestamp)
+
+            fewshotnode, fewshotadj, fewshotnodenameemb, fewshotedgenameemb, fewshotmapping = self.fewshotsubgraph(rootnodetype, fewshot_center, None if tasktimestamp is None else tasktimestamp[tarnode])
+            fewshotnode, fewshotedge_index, fewshotedge_attr_type, fewshotedge_attr = unifyheterograph(rootnodetype, fewshotnode, fewshotnodenameemb, fewshotedgenameemb, fewshotadj)
+
+            node, edge_index, edge_attr_type, edge_attr = mergefewshotgraph(node, edge_index, edge_attr_type, edge_attr, fewshotnode, fewshotedge_index, fewshotedge_attr_type, fewshotedge_attr, tarnode, self.graph.edgenameemb["fewshot"])
+            
+            taskfeat = taskfeat + [tasknameemb for i in range(len(fewshotnode))]
+            mask = mask + [None] * len(fewshotnode)
+
+        node, taskfeat, edge_attr, y = scalefeat(node, taskfeat, edge_attr, y)
+        
+        return  node, mask, taskfeat, edge_index, edge_attr_type, edge_attr, label, y, mapping

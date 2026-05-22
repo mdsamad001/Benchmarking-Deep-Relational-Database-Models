@@ -1,0 +1,84 @@
+commerce-1:
+  - diginetica-downsample-ctr
+  - rel-hm-item-sales
+  - rel-hm-user-churn
+  - retailrocket-cvr
+  - seznam-charge
+  - seznam-prepay
+
+commerce-2:
+  - amazon-churn
+  - amazon-rating
+  - outbrain-small-ctr
+  - rel-avito-ad-ctr
+  - rel-avito-user-clicks
+  - rel-avito-user-visits
+
+others-1:
+  - rel-f1-driver-dnf
+  - rel-f1-driver-position
+  - rel-f1-driver-top3
+  - stackexchange-churn
+  - stackexchange-upvote
+  - virus-wnv-pred
+
+others-2:
+  - airbnb-destination
+  - rel-trial-site-success
+  - rel-trial-study-adverse
+  - rel-trial-study-outcome
+  - talkingdata-demo-pred
+  - telstra-severity
+
+single:
+  - anime_planet-anime_planet-Rating_Score
+  - babies_r_us-babies_r_us-price
+  - beer_ratings-beer_ratings-review_overall
+  - bikedekho-bikedekho-price
+  - bikewale-bikewale-price
+  - buy_buy_baby-buy_buy_baby-price
+  - cardekho-cardekho-price
+  - chocolate_bar_ratings-chocolate_bar_ratings-Rating
+  - clear_corpus-clear_corpus-BT_Easiness
+  - coffee_ratings-coffee_ratings-rating
+  - company_employees-company_employees-current_employee_estimate
+  - employee_remuneration-employee_remuneration-Remuneration
+  - employee_salaries-employee_salaries-current_annual_salary
+  - fifa22_players-fifa22_players-wage_eur
+  - filmtv_movies-filmtv_movies-public_vote
+  - journal_jcr-journal_jcr-2021_JIF
+  - journal_sjr-journal_sjr-H_index
+  - jp_anime-jp_anime-Score
+  - k_drama-k_drama-score
+  - michelin-michelin-Award
+  - mlds_salaries-mlds_salaries-salary_in_usd
+  - movies-movies-revenue
+  - museums-museums-Revenue
+  - mydramalist-mydramalist-rating
+  - nba_draft-nba_draft-value_over_replacement
+  - prescription_drugs-prescription_drugs-WAC_at_Introduction
+  - ramen_ratings-ramen_ratings-Stars
+  - roger_ebert-roger_ebert-critic_rating
+  - rotten_tomatoes-rotten_tomatoes-Rating_Value
+  - spotify-spotify-popularity
+  - us_accidents_counts-us_accidents_counts-Counts
+  - us_accidents_severity-us_accidents_severity-Severity
+  - us_presidential-us_presidential-target
+  - used_cars_24-used_cars_24-Price
+  - used_cars_benz_italy-used_cars_benz_italy-price
+  - used_cars_dot_com-used_cars_dot_com-price
+  - used_cars_pakistan-used_cars_pakistan-Price
+  - used_cars_saudi_arabia-used_cars_saudi_arabia-Price
+  - videogame_sales-videogame_sales-Global_Sales
+  - whisky-whisky-Meta_Critic
+  - wikiliq_beer-wikiliq_beer-Price
+  - wikiliq_spirit-wikiliq_spirit-Price
+  - wina_pl-wina_pl-price
+  - wine_dot_com_prices-wine_dot_com_prices-Prices
+  - wine_dot_com_ratings-wine_dot_com_ratings-Ratings
+  - wine_enthusiasts_prices-wine_enthusiasts_prices-price
+  - wine_enthusiasts_ratings-wine_enthusiasts_ratings-points
+  - wine_vivino_price-wine_vivino_price-Price
+  - wine_vivino_rating-wine_vivino_rating-Rating
+  - yelp-yelp-stars
+  - zomato-zomato-rating
