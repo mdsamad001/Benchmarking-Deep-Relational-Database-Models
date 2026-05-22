@@ -1,0 +1,15 @@
+{
+  "db": "rel-f1_only",
+  "task": "rel-f1-driver-position",
+  "metric_name": "mse",
+  "seeds": {
+    "0": {
+      "best_val_epoch": 66,
+      "best_val_metric": 0.31859999895095825,
+      "metric_name": "mse",
+      "test_metric": 0.47205522656440735,
+      "best_ckpt_path": "/home/admiral/Fuad/Griffin-small/checkpoints/scratch_rel-f1-driver-position/seed_0/best_checkpoint",
+      "seed_dir": "/home/admiral/Fuad/Griffin-small/results/rel-f1_only/rel-f1-driver-position/1/seed_0"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# Griffin requirements for NVIDIA DGX Spark GB10
+# Architecture: aarch64 (ARM Grace CPU) + Blackwell GPU
+# OS: DGX OS (Ubuntu 24.04 LTS)
+# CUDA: 13.0, compute capability sm_121
+#
+# !! PyTorch must be installed FIRST from the cu130 index !!
+# See setup_dgx_spark.sh — do NOT pip install from this file directly.
+#
+# The torch_geometric dependency has been removed.  The two classes
+# that were imported (MeanAggregation, MaxAggregation) are now
+# reimplemented in hmodel.py using native PyTorch scatter ops.
+# This eliminates the ARM compilation nightmare for torch-scatter
+# / torch-sparse / torch-cluster / torch-spline-conv.
+
+# --- Core training deps (installed AFTER torch) ---
+accelerate>=1.2.0
+datasets>=2.20.0
+safetensors>=0.4.0
+torchmetrics>=1.0.0
+numpy>=1.24,<2.0
+pyyaml>=6.0
+matplotlib>=3.7
+seaborn>=0.12
+
+# --- Data conversion only (not needed for training) ---
+# Uncomment if you need to rebuild the dataset from scratch:
+# pqdm>=0.2
+# pandas>=2.0
+# sentence-transformers>=2.2
+# tqdm>=4.65
