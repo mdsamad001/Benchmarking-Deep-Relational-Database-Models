@@ -145,8 +145,6 @@ python scripts/example_finetune.py \
 | Classification | cross-entropy | AUROC | AUROC |
 | Regression | MSE | MSE | MSE |
 
-All reported metric values are positive. For regression, lower MSE is better. For classification, higher AUROC is better. Best checkpoint selection respects direction automatically.
-
 ---
 
 ## Citation
