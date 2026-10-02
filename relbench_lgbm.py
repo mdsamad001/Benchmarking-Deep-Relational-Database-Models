@@ -25,7 +25,7 @@ DROP_NESTED_CATS = True
 DEFAULT_FANOUT_HOP1 = 10
 DEFAULT_FANOUT_HOP2 = 30
 
-NUM_AGGS = ("mean", "sum", "max", "min")
+NUM_AGGS = ("mean", "sum")
 CAT_AGGS = ("nunique",)
 
 
@@ -704,7 +704,7 @@ def main(
     print(f"[BASELINE VAL MSE]  {val_mse_baseline:.6f}")
     print(f"[BASELINE TEST MSE] {test_mse_baseline:.6f}")
 
-    drop_cols = [c for c in ["seed_time"] if c in Xtr.columns]
+    drop_cols = [c for c in ["entity_id", "seed_time"] if c in Xtr.columns]
     keep_cols = [c for c in Xtr.columns if c not in drop_cols]
 
     pp = fit_preproc(Xtr, keep_cols=keep_cols)
